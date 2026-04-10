@@ -1,0 +1,94 @@
+import pandas as pd
+from google.colab import files
+import unicodedata
+import re
+
+# --- FUNÇÕES DE TRATAMENTO ---
+def normalizar(texto):
+    if pd.isna(texto): return ""
+    texto = str(texto).strip().upper()
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("utf-8")
+    return " ".join(re.sub(r'[^A-Z\s]', ' ', texto).split())
+
+def extrair_id_workday(worker_string):
+    match = re.search(r'\((\d+)\)', str(worker_string))
+    if match:
+        try: return str(int(match.group(1)))
+        except: return None
+    return None
+
+def limpar_nome_simples(worker_string):
+    nome = re.sub(r'\(.*\)', '', str(worker_string))
+    nome = re.sub(r'\[.*\]', '', nome)
+    return normalizar(nome)
+
+# --- CARGA DOS DADOS ---
+print("Selecione o arquivo Excel...")
+uploaded = files.upload()
+nome_arq = list(uploaded.keys())[0]
+
+df_wd = pd.read_excel(nome_arq, sheet_name="Workday")
+df_ds = pd.read_excel(nome_arq, sheet_name="Datasul", header=1)
+if "Matrícula" not in df_ds.columns:
+    df_ds = pd.read_excel(nome_arq, sheet_name="Datasul")
+
+# --- PREPARAÇÃO DO DICIONÁRIO ---
+df_ds["ID_LIMPO_DS"] = df_ds["Matrícula"].apply(lambda x: str(int(float(x))) if pd.notna(x) and str(x).strip() != "" else "")
+df_ds_valid = df_ds[df_ds["ID_LIMPO_DS"] != ""].copy()
+dict_ds = df_ds_valid.set_index("ID_LIMPO_DS")[["Nome", "Local Pgto-Descrição", "Matrícula"]].to_dict('index')
+
+df_ds_valid["NOME_NORMALIZADO"] = df_ds_valid["Nome"].apply(normalizar)
+lista_nomes_ds = df_ds_valid[["NOME_NORMALIZADO", "Nome", "Matrícula", "Local Pgto-Descrição"]].values.tolist()
+
+# --- BUSCA INTELIGENTE ---
+def buscar_funcionario(row):
+    worker_raw = row["Worker"]
+    id_extraido = extrair_id_workday(worker_raw)
+    nome_wd_limpo = limpar_nome_simples(worker_raw)
+    
+    if id_extraido and id_extraido in dict_ds:
+        d = dict_ds[id_extraido]
+        return pd.Series([d["Nome"], d["Matrícula"], d["Local Pgto-Descrição"]])
+    
+    partes = nome_wd_limpo.split()
+    if len(partes) >= 2:
+        p_nome, u_nome = partes[0], partes[-1]
+        for nome_norm, nome_orig, mat, local in lista_nomes_ds:
+            if nome_norm.startswith(p_nome) and u_nome in nome_norm:
+                return pd.Series([nome_orig, mat, local])
+                
+    return pd.Series([None, None, None])
+
+# --- EXECUÇÃO ---
+df_wd[["Nome_DS", "Matricula_DS", "Local_DS"]] = df_wd.apply(buscar_funcionario, axis=1)
+
+# --- VERIFICAÇÃO COM FILTRO DE ERROS ---
+def verificar(row):
+    if pd.isna(row["Nome_DS"]): 
+        return "NÃO ENCONTRADO NO DATASUL"
+    
+    loc_wd = normalizar(row["Reportal Function"])
+    loc_ds = normalizar(row["Local_DS"])
+    
+    if loc_wd != loc_ds:
+        return f"DIVERGENTE: WD({row['Reportal Function']}) vs DS({row['Local_DS']})"
+    return "OK"
+
+df_wd["Status"] = df_wd.apply(verificar, axis=1)
+
+# --- FILTRANDO APENAS DIVERGENTES E NÃO ENCONTRADOS ---
+# Removemos todos que estão "OK"
+df_erros = df_wd[df_wd["Status"] != "OK"].copy()
+
+# --- EXPORTAÇÃO ---
+df_relatorio = df_erros[[
+    "Worker", "Nome_DS", "Matricula_DS", "Reportal Function", "Local_DS", "Status"
+]].copy()
+
+df_relatorio.columns = ["Worker (Workday)", "Nome (Datasul)", "Matrícula", "Local (Workday)", "Local (Datasul)", "O que corrigir"]
+
+nome_saida = "RELATORIO_DE_ERROS_E_DIVERGENCIAS.xlsx"
+df_relatorio.sort_values(by="Worker (Workday)").to_excel(nome_saida, index=False)
+files.download(nome_saida)
+
+print(f"\n⚠️ Relatório gerado apenas com as pendências: {len(df_erros)} casos encontrados.")
