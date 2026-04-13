@@ -1,0 +1,75 @@
+import pandas as pd
+from google.colab import files
+import unicodedata
+import re
+from datetime import datetime
+
+# --- 1. FUNÇÕES DE LIMPEZA ---
+def limpar_id(valor):
+    if pd.isna(valor): return ""
+    s = str(valor).split('.')[0].strip()
+    match = re.search(r'(\d+)', s)
+    return str(int(match.group(1))) if match else ""
+
+def normalizar_para_comparacao(texto):
+    if pd.isna(texto): return ""
+    texto = str(texto).strip().upper()
+    # Remove acentos
+    texto = ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
+    # Remove caracteres especiais
+    texto = re.sub(r'[^A-Z0-9\s]', '', texto)
+    return " ".join(texto.split())
+
+# --- 2. CARREGAMENTO ---
+print("🚀 Rodando com filtro para 'New Business Sales'...")
+uploaded = files.upload()
+nome_arq = next(iter(uploaded))
+
+df_p1 = pd.read_excel(nome_arq, sheet_name="Planilha1")
+df_ds = pd.read_excel(nome_arq, sheet_name="Datasul", header=1)
+df_wd = pd.read_excel(nome_arq, sheet_name="Workday")
+
+# --- 3. MAPEAMENTO ---
+dict_ds = {limpar_id(r.get('Matrícula')): str(r.get('Local Pgto-Descrição', '')).strip() for _, r in df_ds.iterrows() if limpar_id(r.get('Matrícula'))}
+dict_wd = {limpar_id(r.get('Employee ID')) or limpar_id(r.get('Worker')): str(r.get('Reportal Function', '')).strip() for _, r in df_wd.iterrows()}
+
+# --- 4. CONSTRUÇÃO DO RESULTADO COM FILTRO DE ORTOGRAFIA ---
+resultado_final = []
+
+for _, row in df_p1.iterrows():
+    id_ds_ref = limpar_id(row.get('Matrícula Datasul') or row.get('Matrícula'))
+    id_wd_ref = limpar_id(row.get('Matrícula Workday') or row.get('Matr WD'))
+    nome_completo = str(row.get('Nome', '')).strip()
+    
+    info_ds = dict_ds.get(id_ds_ref, "NÃO ENCONTRADO NO DATASUL")
+    info_wd = dict_wd.get(id_wd_ref, "NÃO ENCONTRADO NO WORKDAY")
+    
+    txt_ds = normalizar_para_comparacao(info_ds)
+    txt_wd = normalizar_para_comparacao(info_wd)
+    
+    # --- REGRA DE EXCEÇÃO (FILTRO INTELIGENTE) ---
+    # Se os dois começarem com "NEW BUSINESS SALES", ignoramos a diferença (consideramos OK)
+    termo_vendas = "NEW BUSINESS SALES"
+    if txt_ds.startswith(termo_vendas) and txt_wd.startswith(termo_vendas):
+        continue # Pula para o próximo, não coloca no relatório de erro
+        
+    # Comparação padrão para os outros casos
+    if txt_ds != txt_wd:
+        resultado_final.append({
+            "Matrícula": id_ds_ref,
+            "Nome": nome_completo,
+            "Local Pgto-Descrição (Datasul)": info_ds,
+            "Reportal Function (Workday)": info_wd,
+            "Situação": "ERRO",
+            "Motivo": "Divergente" if "NÃO ENCONTRADO" not in (info_ds + info_wd) else "Cadastro Ausente"
+        })
+
+# --- 5. EXPORTAÇÃO ---
+df_final = pd.DataFrame(resultado_final)
+if not df_final.empty:
+    nome_saida = f"Divergencias_Filtradas_{datetime.now().strftime('%H%M')}.xlsx"
+    df_final.to_excel(nome_saida, index=False)
+    files.download(nome_saida)
+    print(f"\n✅ Relatório gerado! Filtramos as variações de 'New Business Sales'. Divergências restantes: {len(df_final)}")
+else:
+    print("\n✅ Excelente! Nenhuma divergência real encontrada após os filtros.")
