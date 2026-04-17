@@ -1,0 +1,74 @@
+import pandas as pd
+from google.colab import files
+from datetime import datetime
+
+# 1. FUNÇÕES DE LIMPEZA
+def limpar_id(valor):
+    if pd.isna(valor) or str(valor).strip() in ("", "nan", "0"): return ""
+    try: return str(int(float(valor)))
+    except: return str(valor).strip()
+
+# 2. CARGA DOS DADOS
+print("📂 Selecione o arquivo Excel...")
+uploaded = files.upload()
+nome_arq = list(uploaded.keys())[0]
+
+df_hrp = pd.read_excel(nome_arq, sheet_name="HRP")
+df_ds = pd.read_excel(nome_arq, sheet_name="Datasul")
+
+# 3. PREPARAÇÃO
+data_corte = datetime(2026, 3, 30)
+
+df_hrp['Data Admissão'] = pd.to_datetime(df_hrp['Data Admissão'], errors='coerce')
+df_ds['Dt admissão'] = pd.to_datetime(df_ds['Dt admissão'], errors='coerce')
+df_hrp["Mat_Busca"] = df_hrp["Matrícula"].apply(limpar_id)
+df_ds["Mat_Busca"] = df_ds["Matrícula"].apply(limpar_id)
+
+dict_hrp = df_hrp.set_index("Mat_Busca")[["ID WD", "Nome"]].to_dict('index')
+
+# 4. LÓGICA DE VALIDAÇÃO
+def validar_regra_data(row):
+    matricula = row["Mat_Busca"]
+    data_adm = row["Dt admissão"]
+    id_ds = limpar_id(row["ID Workday"])
+    
+    dados_hrp = dict_hrp.get(matricula)
+    id_hrp = limpar_id(dados_hrp["ID WD"]) if dados_hrp else ""
+    
+    # REGRA: Admitidos ATÉ 30/03 -> Devem estar no HRP
+    if data_adm <= data_corte:
+        if not dados_hrp:
+            return id_ds, "ERRO: Admitido até 30/03 mas AUSENTE no HRP"
+        # Se estiver no HRP mas o ID no Datasul estiver em branco ou diferente
+        if id_ds == "" or id_ds != id_hrp:
+            return id_hrp, "ERRO: ID Workday em branco ou divergente"
+        return id_hrp, "OK" 
+            
+    # REGRA: Admitidos APÓS 30/03 -> Não podem estar no HRP
+    else:
+        if dados_hrp:
+            return id_ds, "ERRO: Admitido após 30/03 mas JÁ CONSTA no HRP"
+        return id_ds, "OK"
+
+# Executando a validação
+df_ds[["ID_Final", "Status_Auditoria"]] = df_ds.apply(
+    lambda x: pd.Series(validar_regra_data(x)), axis=1
+)
+
+# 5. FILTRAGEM: APENAS ERROS E LACUNAS
+# Filtra apenas o que não é "OK"
+df_erros_e_lacunas = df_ds[df_ds["Status_Auditoria"].str.contains("ERRO")].copy()
+
+# 6. GERAÇÃO DO ARQUIVO FINAL
+nome_saida = "AUDITORIA_HRP_ADMISSOES_ABRIL_IRREGULARES.xlsx"
+
+if not df_erros_e_lacunas.empty:
+    with pd.ExcelWriter(nome_saida) as writer:
+        # Colunas selecionadas para o relatório ser direto ao ponto
+        colunas_relatorio = ["Matrícula", "Nome", "Dt admissão", "ID Workday", "ID_Final", "Status_Auditoria"]
+        df_erros_e_lacunas[colunas_relatorio].to_excel(writer, sheet_name="Divergencias", index=False)
+
+    print(f"\n✅ Relatório de irregularidades gerado com {len(df_erros_e_lacunas)} itens.")
+    files.download(nome_saida)
+else:
+    print("\n✅ Nenhum erro ou ID em branco encontrado!")
